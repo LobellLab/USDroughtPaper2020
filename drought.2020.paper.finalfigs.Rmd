@@ -1,0 +1,1009 @@
+---
+title: "drought.mar2020.paperfigs"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#First read in county and field level data (these files available from author upon request)
+```{r}
+require('tidyverse')
+require('gridExtra')
+require('fixest')
+
+#read nass county data
+typedf <-'full_100E'
+setwd('~/Dropbox/sens_drought_2019/')
+mzpan <- readRDS(sprintf('data/mzpanbGT34ybothPrec2Hinge_%s.rds',typedf))#  full panel- with all hinges
+#mzcen <- readRDS(sprintf('data/mzcenbGT34ybothPrec2Hinge_%s.rds',typedf))#  full panel- with all hinges
+soypan<- readRDS(sprintf('data/soypanbGT34ybothPrec2Hinge_%s.rds',typedf))#  full panel- with all hinges
+#soycen<- readRDS(sprintf('data/soycenbGT34ybothPrec2Hinge_%s.rds',typedf))#  full panel- with all hinges
+
+stcodes = data.frame(abbr=c("IL","IN","IA","MI","MN","MO","OH","SD","WI"), 
+                     states = c("ILLINOIS","INDIANA","IOWA","MICHIGAN","MINNESOTA","MISSOURI","OHIO","SOUTH DAKOTA","WISCONSIN"))
+mzpan$State = factor(mzpan$State) #removes levels for values that don't exist in panel
+mzpan$cornAreaHarv_ha = mzpan$cornAreaHarv_acres * 0.404686
+mzpan$cornprod = mzpan$cornYield * mzpan$cornAreaHarv_ha
+#mzcen <- mzcen %>% mutate(year_dummy = mzpan$year)
+#soycen <- soycen %>% mutate(year_dummy = soypan$year)
+stressvar= "EDD"
+climvars = c('GDD',stressvar,'prec650','prec650_')
+st.subsets = list(unique(mzpan$State),stcodes$states)
+
+#total production in these states?
+totprod = mzpan %>% group_by(year) %>% filter(State %in% st.subsets[[2]]) %>% summarize(totprod =sum(cornprod))
+#national production in 2015-18 was 346,385,371,364 M tons
+#sum(tail(totprod$totprod,4))/(346+385+371+364)/1e6
+
+#read scym field data
+setwd('~/Dropbox/sens_drought_2019/scym_trends/')
+dat = readRDS('mergedStaticAnnual_maizeScym2020_soyLoAz2017_covar1_2020-02-20.rds')
+yrs = sort(unique(dat$year))
+#remove any values above 20 as outliers
+dat = dat %>% filter(yield_tha < 20)
+dat = dat %>% mutate(pr_total = ppt_apr + ppt_may + ppt_jun + ppt_jul + ppt_aug)
+states_to_use=unique(dat$state)#use all states
+crop = c('Corn')
+subdat = dat %>% filter(state %in% states_to_use,SCYMcrop %in% crop)
+```
+
+#Figure 1 - map of states in study and time series of weather variables
+```{r fig1}
+
+weathbyyr = mzpan %>% group_by(year) %>% filter(State %in% st.subsets[[2]], year %in% 1999:2018) %>%   summarize_at(c('cornYield','GDD','EDD','ppt'),mean,na.rm=T)
+
+trueyield = mzpan %>% group_by(year) %>% filter(State %in% st.subsets[[2]], year %in% 1999:2018) %>%  
+summarize_at(c('cornAreaHarv_ha','cornprod'),sum,na.rm=T)
+trueyield$cornYield = trueyield$cornprod / trueyield$cornAreaHarv_ha
+weathbyyr$cornYield = trueyield$cornYield
+
+cols=c('black','dark green','dark red','dark blue')
+# png(filename=paste0('panel.weather.fig1.png'),width=3.5,h=7.5,units='in',res=200)
+# par(mfrow=c(4,1),mar=c(2,4,1,1))
+pdf(file=paste0('fig1.right.pdf'),width=3.5,h=7.5)
+par(mfrow=c(4,1),mar=c(2,4,1,1))
+plot(weathbyyr$year,weathbyyr$cornYield,xlab='Year',ylab='',lwd=2,type='l',col=cols[1],axes=F)
+axis(1,at=seq(2000,2020,10))
+axis(2,col.axis=cols[1],col=cols[1])
+legend('topleft',bty='n',leg='Maize Yield (t/ha)',text.col = cols[1],inset=c(-.05,0),cex=1.5)
+plot(weathbyyr$year,weathbyyr$GDD,xlab='Year',ylab='',lwd=2,type='l',col=cols[2],axes=F)
+axis(1,at=seq(2000,2020,10))
+axis(2,col.axis=cols[2],col=cols[2])
+legend('topleft',bty='n',leg='GDD',text.col = cols[2],inset=c(-.05,0),cex=1.5)
+#par(new=T)
+plot(weathbyyr$year,weathbyyr$EDD,xlab='Year',ylab='',lwd=2,type='l',col=cols[3],axes=F)
+axis(1,at=seq(2000,2020,10))
+axis(2,col.axis=cols[3],col=cols[3])
+legend('topleft',bty='n',leg='EDD',text.col = cols[3],inset=c(-.05,0),cex=1.5)
+plot(weathbyyr$year,weathbyyr$ppt,xlab='Year',ylab='',lwd=2,type='l',col=cols[4],axes=F)
+axis(1,at=seq(2000,2020,10))
+axis(2,col.axis=cols[4],col=cols[4])
+legend('topleft',bty='n',leg='Precip (mm)',text.col = cols[4],inset=c(-.05,0),cex=1.5)
+dev.off()
+
+```
+
+#Figure 2 - panel estimates
+```{r}
+vars=c(climvars,'year',paste0('year:',climvars))
+
+get.boot = function(st.use,start.yr,end.yr,omit.yrs,crop='maize',nboot=200){
+  nyr = end.yr - start.yr + 1
+  if (crop == 'maize') temp=mzpan %>% filter(State %in% st.use)
+#  if (crop == 'soy') temp=soypan %>% filter(State %in% st.use)  
+  if (use.stateyr) temp$State = factor(temp$State)  #removes levels not used
+  yrs.to.samp = start.yr:end.yr
+  yrs.to.samp = yrs.to.samp[!(yrs.to.samp %in% omit.yrs)]
+  bootcoefs = c()
+  for (i in 1:nboot){
+    yrsamp = sample(yrs.to.samp,size=nyr,replace = T)
+    tempdf = temp %>% filter(year == yrsamp[1])
+    for (k in 2:nyr) tempdf = rbind(tempdf, temp %>% filter(year == yrsamp[k]))
+    fit.temp = feols(form.use,data=tempdf)
+    bootcoefs = rbind(bootcoefs,fit.temp$coeftable$Estimate)
+  }
+  bootcoefs = data.frame(bootcoefs)
+  names(bootcoefs) = row.names(fit.temp$coeftable)
+  bootcoefs$GDDperc =  100*((bootcoefs$GDD + bootcoefs$'GDD:year' * end.yr) / (bootcoefs$GDD + bootcoefs$'GDD:year' * start.yr) - 1)
+  bootcoefs$EDDperc =  100*((bootcoefs$EDD + bootcoefs$'EDD:year' * end.yr) / (bootcoefs$EDD + bootcoefs$'EDD:year' * start.yr) - 1)
+  bootcoefs$prec650perc =  100*((bootcoefs$prec650 + bootcoefs$'prec650:year' * end.yr) / (bootcoefs$prec650 + bootcoefs$'prec650:year' * start.yr) - 1)
+  bootcoefs$prec650_perc =  100*((bootcoefs$prec650_ + bootcoefs$'prec650_:year' * end.yr) / (bootcoefs$prec650_ + bootcoefs$'prec650_:year' * start.yr) - 1)
+  bootcoefs
+}
+
+start.yr = 1999
+end.yr = 2018
+omit.yrs = 2012
+
+nboot = 200
+use.stateyr= T
+use.log = 0
+yieldvar = 'cornYield'
+if (use.log == 1) yieldvar = 'logCorn'
+form.temp = as.formula(paste0(yieldvar," ~ ", paste(vars, collapse = " + "),'| fips'))
+form.wstateyr = as.formula(paste0(yieldvar," ~ ", paste(vars, collapse = " + "),' + State:year | fips'))
+if (use.stateyr) form.use = form.wstateyr else form.use = form.temp
+bootcfs=list()
+bootcfs[['fullstates']][['allyrs']] = get.boot(st.use = st.subsets[[1]],1999,2018,omit.yrs = NA)
+bootcfs[['fullstates']][['no2012']] = get.boot(st.use = st.subsets[[1]],1999,2018,omit.yrs = 2012)
+bootcfs[['9states']][['allyrs']] = get.boot(st.use = st.subsets[[2]],1999,2018,omit.yrs = NA)
+bootcfs[['9states']][['no2012']] = get.boot(st.use = st.subsets[[2]],1999,2018,omit.yrs = 2012)
+
+plot5 = function(crop, plotvar, color_pan,xlimit,ylimit,errorbar,ylab='',savetofile){
+  yearavg = mean(1981:2018) #1999.5
+  if (crop == 'maize'){
+    pancoefs = mzpancoefs
+   }else if(crop=='soy'){
+    pancoefs = soypancoefs
+  }
+  if(plotvar=='heatvar'){
+    var1='GDD'  #1: refers to first part
+    var2='EDD' #2 refers to second part after inflection point
+    xlabel = "Temperature (degrees C)"
+    inflpoint=30
+  }else if(plotvar=='precip'){
+    xlabel = "Precipitation (mm)"
+    if (crop=='maize'){
+      var1='prec650'
+      var2='prec650_'
+      inflpoint=650
+    }else if(crop=='soy'){
+      var1='prec550'
+      var2='prec550_'
+      inflpoint=550
+    }
+  }
+
+  ests1 = (pancoefs[,var1] + pancoefs[,paste0(var1,':year')]*yearavg)
+  ests2 = (pancoefs[,var2] + pancoefs[,paste0(var2,':year')]*yearavg)
+  #   #ests: Panel(1column)- SFD(2column)
+  #   
+  #   mids1 = apply(ests1,2,mean)
+  mids1 = mean(ests1)
+  lows1 = quantile(ests1,prob=.10)
+  his1 = quantile(ests1,prob=.90)
+  mids2 = mean(ests2)
+  lows2 = quantile(ests2,prob=.10)
+  his2 = quantile(ests2,prob=.90)
+  
+  # Create plot area- heat var
+  x <- c(xlimit[1]:xlimit[2])
+  y <- matrix(0,length(x),1)
+  plot(x,y, xlim=xlimit, ylim=ylimit, pch=16, col = "white",
+       xlab = xlabel,
+       ylab = ylab,las=1)
+
+  # # #PANEL
+  curve(mids1[1]*x - mids1[1]*inflpoint, add = TRUE, from = xlimit[1], to = inflpoint, lwd = 2, col = color_pan)
+  curve(mids2[1]*(x-inflpoint), add = TRUE, from = inflpoint, to = xlimit[2], lwd = 2, col = color_pan)
+
+  if (errorbar==TRUE){
+    # ADD shade error
+    x1 =xlimit[1]:inflpoint
+    x2 =inflpoint:xlimit[2]
+    #Panel
+    y1_l =lows1[1]*x1 - lows1[1]*inflpoint
+    y1_h =his1[1]*x1 - his1[1]*inflpoint
+    y2_l =lows2[1]*x2 - lows2[1]*inflpoint
+    y2_h =his2[1]*x2 - his2[1]*inflpoint
+    polygon(x=c(x1,rev(x1)),c(y1_l,rev(y1_h)),col=alpha(color_pan,0.2),border=NA)
+    polygon(x=c(x2,rev(x2)),c(y2_l,rev(y2_h)),col=alpha(color_pan,0.2),border=NA)
+  }
+  # Add line showing Infaltion point threshold
+  grid()
+  abline(v=inflpoint, lty=3)
+  if(savetofile ==TRUE){
+    #dev.print(png,paste0(sprintf('C:/Users/sditom/Google Drive/sens_drought_2019/figs/avgsens_%s_%s.png',crop, plotvar)),width=750,height=500,res=100)
+  }
+}
+
+mzpancoefs = bootcfs[['9states']][['allyrs']]
+
+fname = 'panel.meanresponse.fig2.png'
+ylab = 'Change in yields (t/ha)'
+ylim1=c(-0.9,0.02)
+ylim2=c(-0.9, 0.1)
+
+#png(filename=fname,width=8,h=3,units='in',res=200)
+fname = 'fig2.pdf'
+pdf(file=fname,width=3.5,h=5.5)
+par(mfrow=c(2,1),mar=c(5,4,1,1),las=1,cex=.6)
+plot5(crop='maize',plotvar='heatvar',color_pan='darkgreen',xlimit=c(8,40),ylimit=ylim1,errorbar=TRUE,ylab=ylab,savetofile=FALSE); 
+legend('topleft','(a)',bty='n',cex=2,adj=c(1,1))
+plot5(crop='maize',plotvar='precip', color_pan='darkblue',xlimit=c(0,1000),ylimit=ylim2,errorbar=TRUE,ylab=ylab,savetofile=FALSE)
+legend('topleft','(b)',bty='n',cex=2,adj=c(1,1))
+dev.off()
+
+#make plot comparing log and nonlog, for supplement
+use.log=1
+yieldvar = 'logCorn'
+form.wstateyr = as.formula(paste0(yieldvar," ~ ", paste(vars, collapse = " + "),' + State:year | fips'))
+if (use.stateyr) form.use = form.wstateyr else form.use = form.temp
+bootcfs[['logversion']] = get.boot(st.use = st.subsets[[2]],1999,2018,omit.yrs = NA)
+
+fname = 'panel.meanresponse.logversion.fig2.png'
+png(filename=fname,width=8,h=6,units='in',res=200)
+par(mfrow=c(2,2),mar=c(5,4,4,2),las=1,cex=.6)
+ylab = 'Change in yields (t/ha)'
+ylim1=c(-0.9,0.02)
+ylim2=c(-0.9, 0.1)
+mzpancoefs = bootcfs[['9states']][['allyrs']]
+plot5(crop='maize',plotvar='heatvar',color_pan='darkgreen',xlimit=c(8,40),ylimit=ylim1,errorbar=TRUE,ylab=ylab,savetofile=FALSE); 
+legend('topleft','(a)',bty='n',cex=2,adj=c(1,1))
+plot5(crop='maize',plotvar='precip', color_pan='darkblue',xlimit=c(0,1000),ylimit=ylim2,errorbar=TRUE,ylab=ylab,savetofile=FALSE)
+legend('topleft','(b)',bty='n',cex=2,adj=c(1,1))
+mzpancoefs = bootcfs[['logversion']]
+ylab = 'Change in log yields'
+ylim1=c(-0.2,0.02)
+ylim2=c(-0.2, 0.02)
+plot5(crop='maize',plotvar='heatvar',color_pan='darkgreen',xlimit=c(8,40),ylimit=ylim1,errorbar=TRUE,ylab=ylab,savetofile=FALSE); 
+legend('topleft','(c)',bty='n',cex=2,adj=c(1,1))
+plot5(crop='maize',plotvar='precip', color_pan='darkblue',xlimit=c(0,1000),ylimit=ylim2,errorbar=TRUE,ylab=ylab,savetofile=FALSE)
+legend('topleft','(d)',bty='n',cex=2,adj=c(1,1))
+dev.off()
+
+
+```
+
+determine percent of estimates that show neg mean values and neg trends
+```{r}
+get.per = function(pancoefs,var='GDD'){
+ yearavg = mean(1981:2018) #1999.5
+ ests1 = (pancoefs[,var] + pancoefs[,paste0(var,':year')]*yearavg)
+ fneg = sum(ests1<0)/length(ests1)
+ fnegtrend = sum(pancoefs[,paste0(var,':year')] < 0)/nrow(pancoefs)
+ print(paste('frac negative',fneg))
+ print(paste('frac trend neg',fnegtrend))
+}
+get.per(mzpancoefs,'GDD')
+get.per(mzpancoefs,'EDD')
+get.per(mzpancoefs,'prec650')
+get.per(mzpancoefs,'prec650_')
+```
+
+
+#Figure 3 - panel sens change over time
+```{r}
+lab.names = c("GDDperc","EDDperc","prec650perc","prec650_perc")
+
+bp1 = function(pd,leg = c('All years','excluding 2012')){  
+  par(mfrow=c(1,1),mar=c(5,4,2,2))
+  cols=gray(c(.3,.6))
+  plot.ord = c(1,5,2,6,3,7,4,8)
+  ats = c(1:2,4:5,7:8,10:11)
+  boxplot(pd[,plot.ord],col=cols[1:2],horizontal = T,range=0,at=ats,ylim=c(-150,150),xlim=c(0,13),
+          xlab='% Change in Beta, 1999-2018',axes=F)
+  axis(1)
+  axis(2,at=.5+c(1,4,7,10),labels = c('GDD','EDD','P1','P2'))
+  legend('topleft',bty='n',leg=leg,ncol=2,fill=cols[1:2])
+  box()
+}
+
+pd = cbind(bootcfs[['9states']][['allyrs']][,lab.names],
+           bootcfs[['9states']][['no2012']][,lab.names])
+fname = 'panel.percchange.9states.fig3.png'
+
+#png(filename=fname,width=5,h=4,units='in',res=200)
+pdf(file='fig3.pdf',width=5,h=4)
+bp1(pd)
+dev.off()
+
+pd = cbind(bootcfs[['fullstates']][['allyrs']][,lab.names],
+           bootcfs[['fullstates']][['no2012']][,lab.names])
+
+png(filename=paste0('panel.percchange.allstates.fig3.png'),width=5,h=4,units='in',res=200)
+bp1(pd)
+dev.off()
+
+#compare logs and levels
+pd = cbind(bootcfs[['9states']][['allyrs']][,lab.names],
+           bootcfs[['logversion']][,lab.names])
+fname = 'panel.percchange.9states.logversion.fig3.png'
+png(filename=fname,width=5,h=4,units='in',res=200)
+bp1(pd,leg=c('Levels','Logs'))
+dev.off()
+
+#make a plot for 1981-2018
+bootcfs[['9states']][['addearly']] = get.boot(st.use = st.subsets[[2]],1981,2018,omit.yrs = NA)
+bootcfs[['9states']][['addearly_no2012']] = get.boot(st.use = st.subsets[[2]],1981,2018,omit.yrs = 2012)
+pd = cbind(bootcfs[['9states']][['allyrs']][,lab.names],
+           bootcfs[['9states']][['addearly']][,lab.names])
+
+fname = 'panel.percchange.9states.start1981.fig3.png'
+png(filename=fname,width=5,h=4,units='in',res=200)
+bp1(pd,leg=c('1999-2018','1981-2018'))
+dev.off()
+
+```
+
+compare bootstrap estimate to clustering s.e. by year
+```{r}
+vars=c(climvars,'year',paste0('year:',climvars))
+logyield = 'logCorn'
+absyield = 'cornYield'
+#form.temp = as.formula(paste0(absyield," ~ ", paste(vars, collapse = " + "),'| fips'))
+form.wstateyr = as.formula(paste0(absyield," ~ ", paste(vars, collapse = " + "),' + State:year | fips'))
+
+st.use=st.subsets[[2]]
+temp=mzpan %>% filter(State %in% st.use)
+temp$State = factor(temp$State)  #removes levels not used
+cornfit = feols(form.wstateyr,data=temp)
+cornfit.no2012 = feols(form.wstateyr,data=temp %>% filter(year != 2012))
+
+out=esttable(list(cornfit,cornfit.no2012),se='twoway',cluster=c('year','fips'),digits=5,subtitles = c('All years, 1981-2018','Exclude 2012'))
+write.csv(out,file='panel.coef.clustered.csv')
+clus.coef = summary(fit.temp,cluster=c('fips','year'))$coeftable
+bootmean = apply(bootcfs[['9states']][['allyrs']],2,mean)
+bootsd = apply(bootcfs[['9states']][['allyrs']],2,sd)
+
+# start.yr=1999; end.yr = 2018
+# perc.change = ssapply(climvars, function(x){
+#   pchange = 100*((clus.coef[x,1] + clus.coef[paste0(x,':year'),1] * end.yr) / (clus.coef[x,1] + clus.coef[paste0(x,':year'),1] * start.yr) - 1)
+#   pchange
+# })
+
+pvars = paste0(climvars,':year')
+pd = data.frame(bootmean=bootmean[pvars],bootsd=bootsd[pvars],clusmean=clus.coef[pvars,1],
+                clussd=clus.coef[pvars,2])
+par(mar=c(5,8,2,2))
+plot(pd[,1],1:4,axes=F,xlab='Coefficient',ylab='',xlim=c(-1e-3,1e-3))
+axis(1);axis(2,at=1:4,label=pvars)
+mult=qnorm(.975)
+for (i in 1:4) segments(pd[i,1]-mult*pd[i,2],i,pd[i,1]+mult*pd[i,2],i,lwd=3,col=gray(.7))
+points(pd[,3],c(1:4) + .1)
+for (i in 1:4) segments(pd[i+.1,3]-mult*pd[i,4],i+.1,pd[i,3]+mult*pd[i,4],i+.1,lwd=3,col=3)
+
+```
+
+
+#Figure 4 and supp- marginal responses to soil properties in field level (either rznaws or nccpi)
+```{r}
+soilvar = 'rootznaws'
+#soilvar = 'nccpi3corn'
+if (soilvar == 'rootznaws') {
+  xlim=c(0,350)
+  xlabl='PAWS (mm)'
+  xpred=c(-100,100)
+  breaks=40
+  histylim=c(0,.05)
+}
+if (soilvar == 'nccpi3corn') {
+  xlim=c(0,1)
+  xlabl='NCCPI'
+  xpred=c(-.5,.5)
+  breaks=seq(0,1,.05)
+  histylim=c(0,10)
+}  
+
+ind=which(is.finite(subdat[[soilvar]] * subdat$yield_tha))
+#remove very high rootzn values that appear to be outliers
+#there are some outlier soil values above 350mm of rootznaws (99th percentile is 339), omit values above 350 from further analysis
+if (soilvar == 'rootznaws') ind = ind[which(subdat[ind,soilvar] < 350)]
+soilfit = lowess(subdat[[soilvar]][ind],subdat$yield_tha[ind])
+
+#linear fits with county FE and yearxcounty terms
+subdat2 = subdat %>% select(yield_tha,nccpi3corn,rootznaws,fips5,vpd_july,pr_total,year,state,gdd_10_30,gdd_30_99)
+subdat2 = subdat2 %>% filter(rootznaws < 350 & rootznaws > 0)
+subdat2$soilvar = subdat2[[soilvar]]
+
+soilmod1 = feols(yield_tha ~ soilvar | fips5^year,dat=subdat2)
+
+soilcoef = soilmod1$coefficients 
+
+states = unique(subdat2$state)
+nstate=length(states)
+state_soilmod = lapply(states,function(x) {
+   ind=which(is.finite(subdat2$soilvar*subdat2$yield_tha) & subdat2$state == x)
+   tempfit = feols(yield_tha ~ soilvar | fips5^year,dat=subdat2[ind,])
+   out = tempfit$coefficients })
+
+
+#first plot overall lowess
+#png(filename=paste0(soilvar,'.fig4.png'),width=3,h=7,units='in',res=200)
+pdf(file=paste0(soilvar,'.fig4.pdf'),width=3.5,h=5.5)
+xout = seq(xlim[1],xlim[2],length=1e3)
+yout = approx(soilfit$x,soilfit$y,xout=xout)$y
+par(mfrow=c(2,1),mar=c(4.5,4,.5,.5),xpd=F)
+ylim=c(9.5,12)
+plot(xout,yout,xlab=xlabl,ylab='Average Yield (t/ha)',type='l',col='dark green',ylim=ylim,main='',xlim=xlim,lwd=2)
+legend('topleft','(a)',bty='n',cex=1.5,adj=c(1,0))
+par(new=T)
+a=hist(subdat[[soilvar]][ind],breaks=breaks,plot=F)
+plot(a,col=gray(.7),freq=F,ylim=histylim,axes=F,xlab='',ylab='',main='')
+
+#now plot linear fit by state
+cols=brewer.pal(nstate,'Set3')
+ylim=c(-1,1)
+plot(xpred,xpred*soilcoef[1],lwd=2,type='l',xlab=paste('Delta',xlabl),ylab='Delta Yield (t/ha)',ylim=ylim)
+legend('topleft','(b)',bty='n',cex=1.5,adj=c(1,0))
+for (i in 1:nstate) lines(xpred,xpred*state_soilmod[[i]],col=cols[i],lwd=2)
+lines(xpred,xpred*soilcoef[1],col=1,lwd=2)
+legend("bottomright", inset=c(.05,0), leg=c('all',states),col=c(1,cols),lwd=2,bty='n',ncol=2,cex=.5)
+
+dev.off()
+
+```
+
+
+#Figure 5 - trend in soil response by year
+```{r}
+soilvar = 'rootznaws'
+#soilvar = 'nccpi3corn'
+use.log = 0
+
+if (soilvar == 'rootznaws') {
+  ylab=expression(paste(beta['PAWS'],' (kg ','ha'^-1, 'mm'^-1,')'))
+  if (use.log) ylab = expression(paste('1000*',beta['PAWS'],' (log ','mm'^-1,')'))
+  ylab2=expression(paste('Avg ',beta['PAWS']))
+  ylab3=expression(paste('Delta ',beta['PAWS']))
+  yscale=1000
+}
+if (soilvar == 'nccpi3corn') {
+  ylab=expression(paste(beta['NCCPI'],' (t/ha)'))
+  ylab2=expression(paste('Avg ',beta['NCCPI']))
+  ylab3=expression(paste('Delta ',beta['NCCPI']))
+  yscale = 1
+}  
+
+
+subdat2$soilvar = subdat2[[soilvar]]
+subdat2$yieldvar = subdat2[['yield_tha']]
+
+yrs = sort(unique(subdat2$year))
+soilcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yieldvar ~ soilvar | fips5^year,subdat2 %>% filter(year == x))$coeftable[1]))
+  
+soilmod_wfipsyr = feols(yieldvar ~ soilvar + soilvar : year | fips5^year,dat=subdat2)
+soilbeta.byyr = soilmod_wfipsyr$coefficients['soilvar'] + yrs * soilmod_wfipsyr$coefficients['soilvar:year'] 
+
+states = unique(subdat2$state)
+yrs=sort(unique(subdat2$year))
+nstate=length(states)
+state_soilbyyr = lapply(states,function(x) {
+   ind=which(is.finite(subdat2[[soilvar]]*subdat2$yieldvar) & subdat2$state == x)
+   tempfit = feols(yieldvar ~ soilvar + soilvar : year | fips5^year,dat=subdat2[ind,])
+   out = tempfit$coefficients['soilvar'] + yrs * tempfit$coefficients['soilvar:year']  })
+
+#plot estimate in each year and then linear trend by state
+# png(filename=fname,width=8,h=3,units='in',res=200)
+# par(mfrow=c(1,2),mar=c(5,5,1,.5),xpd=F)
+# ylim=yscale*range(unlist(state_soilbyyr))
+# plot(yrs,yscale*soilcoefs.byyr,type='l',xlab='Year',ylab=ylab,ylim=ylim,lwd=2,cex.axis=1.0)
+# lines(yrs,yscale*soilbeta.byyr,lwd=2,lty=2)
+# 
+# cols=brewer.pal(nstate,'Set3')
+# plot(yrs,yscale*soilbeta.byyr,lwd=2,type='l',xlab='year',ylab=ylab,ylim=ylim,cex.axis=1.0)
+# for (i in 1:nstate) lines(yrs,yscale*state_soilbyyr[[i]],col=cols[i],lwd=2)
+# par(xpd=T)
+# legend("topleft", inset=c(.03,0), leg=c('all',states),col=c(1,cols),lwd=2,bty='n',ncol=2,cex=.6)
+# dev.off()
+# 
+# #test significance of trend
+# summary(lm(soilcoefs.byyr ~ yrs))
+# omit = which(yrs == 2012)
+# summary(lm(soilcoefs.byyr[-omit] ~ yrs[-omit]))
+
+#an alternative 
+xvals = yscale * c(mean(soilbeta.byyr),sapply(state_soilbyyr,mean))
+getdel = function(x) diff(range(x))
+yvals = yscale * c(getdel(soilbeta.byyr),sapply(state_soilbyyr,getdel))
+
+altfname = paste0(soilvar,'.fig5alt.png')
+pan.labs=c('(a)','(b)') 
+#png(filename=altfname,width=8,h=3,units='in',res=200)
+#par(mfrow=c(1,2),mar=c(5,5,1,.5),xpd=F)
+pdf(file='fig5.pdf',width=3.5,h=5.5)
+par(mfrow=c(2,1),mar=c(4,5,1,1),xpd=F)
+ylim=yscale*range(unlist(state_soilbyyr))
+plot(yrs,yscale*soilcoefs.byyr,type='l',xlab='Year',ylab=ylab,ylim=ylim,lwd=2,cex.axis=1.0)
+lines(yrs,yscale*soilbeta.byyr,lwd=2,lty=2)
+legend('topleft',pan.labs[1],bty='n',cex=1.5,adj=c(1,0))
+
+cols=brewer.pal(nstate,'Set3')
+plot(xvals,yvals,col=c(1,cols),xlim=range(xvals)*c(0,1.1),ylim=range(yvals)*c(0,1.1),
+     xlab=ylab2,ylab=ylab3)
+text(xvals,yvals,labels=c('All',states),pos=4,cex=.9,col=c(1,cols))
+legend('topleft',pan.labs[2],bty='n',cex=1.5,adj=c(1,0))
+dev.off()
+
+
+```
+make a version of above that compares logs
+```{r}
+
+subdat2$yieldvar = log(subdat2[['yield_tha']])
+yrs = sort(unique(subdat2$year))
+logsoilcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yieldvar ~ soilvar | fips5^year,subdat2 %>% filter(year == x))$coeftable[1]))
+  
+logsoilmod_wfipsyr = feols(yieldvar ~ soilvar + soilvar : year | fips5^year,dat=subdat2)
+logsoilbeta.byyr = logsoilmod_wfipsyr$coefficients['soilvar'] + yrs * logsoilmod_wfipsyr$coefficients['soilvar:year'] 
+logstate_soilbyyr = lapply(states,function(x) {
+   ind=which(is.finite(subdat2[[soilvar]]*subdat2$yieldvar) & subdat2$state == x)
+   tempfit = feols(yieldvar ~ soilvar + soilvar : year | fips5^year,dat=subdat2[ind,])
+   out = tempfit$coefficients['soilvar'] + yrs * tempfit$coefficients['soilvar:year']  })
+
+
+#make log version
+altfname = altfname = paste0(soilvar,'.logversion.fig5alt.png')
+pan.labs=c('(a)','(b)','(c)','(d)')
+ylab=expression(paste(beta['PAWS'],' (kg ','ha'^-1, 'mm'^-1,')'))
+logylab = expression(paste(beta['PAWS'],' (log ','mm'^-1,')'))
+ylab2=expression(paste('Avg ',beta['PAWS']))
+ylab3=expression(paste('Delta ',beta['PAWS']))
+    
+par(mfrow=c(2,2),mar=c(5,5,1,.5),xpd=F)
+cols=brewer.pal(nstate,'Set3')
+yscale=1000
+ylim=yscale*range(unlist(state_soilbyyr))
+plot(yrs,yscale*soilcoefs.byyr,type='l',xlab='Year',ylab=ylab,ylim=ylim,lwd=2,cex.axis=1.0)
+lines(yrs,yscale*soilbeta.byyr,lwd=2,lty=2)
+legend('topleft',pan.labs[1],bty='n',cex=1.5,adj=c(1,0))
+xvals = yscale * c(mean(soilbeta.byyr),sapply(state_soilbyyr,mean))
+getdel = function(x) diff(range(x))
+yvals = yscale * c(getdel(soilbeta.byyr),sapply(state_soilbyyr,getdel))
+plot(xvals,yvals,col=c(1,cols),xlim=range(xvals)*c(0,1.1),ylim=range(yvals)*c(0,1.1),
+     xlab=ylab2,ylab=ylab3)
+text(xvals,yvals,labels=c('All',states),pos=4,cex=.9,col=c(1,cols))
+legend('topleft',pan.labs[2],bty='n',cex=1.5,adj=c(1,0))
+
+yscale = 1000
+ylim=yscale*range(unlist(logstate_soilbyyr))
+plot(yrs,yscale*logsoilcoefs.byyr,type='l',xlab='Year',ylab=logylab,ylim=ylim,lwd=2,cex.axis=1.0)
+lines(yrs,yscale*logsoilbeta.byyr,lwd=2,lty=2)
+legend('topleft',pan.labs[3],bty='n',cex=1.5,adj=c(1,0))
+xvals = yscale * c(mean(logsoilbeta.byyr),sapply(logstate_soilbyyr,mean))
+getdel = function(x) diff(range(x))
+yvals = yscale * c(getdel(logsoilbeta.byyr),sapply(logstate_soilbyyr,getdel))
+plot(xvals,yvals,col=c(1,cols),xlim=range(xvals)*c(0,1.1),ylim=range(yvals)*c(0,1.1),
+     xlab=ylab2,ylab=ylab3)
+text(xvals,yvals,labels=c('All',states),pos=4,cex=.9,col=c(1,cols))
+legend('topleft',pan.labs[4],bty='n',cex=1.5,adj=c(1,0))
+
+dev.print(png,altfname,width=8,h=6,units='in',res=200)
+
+```
+
+
+compare linear mod to nonlinear model and to different types of FE
+```{r}
+soilvar = 'rootznaws'
+#soilvar = 'nccpi3corn'
+if (soilvar == 'rootznaws') {
+  xlim=c(0,350)
+  xlabl='PAWS (mm)'
+  xpred=c(-100,100)
+  breaks=40
+  histylim=c(0,.05)
+}
+if (soilvar == 'nccpi3corn') {
+  xlim=c(0,1)
+  xlabl='NCCPI'
+  xpred=c(-.5,.5)
+  breaks=seq(0,1,.05)
+  histylim=c(0,10)
+}  
+
+ind=which(is.finite(subdat[[soilvar]] * subdat$yield_tha))
+#remove very high rootzn values that appear to be outliers
+if (soilvar == 'rootznaws') ind = ind[which(subdat[ind,soilvar] < 350)]
+soilfit = lowess(subdat[[soilvar]][ind],subdat$yield_tha[ind])
+
+#linear fits with county FE and yearxcounty terms
+subdat2 = subdat %>% select(yield_tha,nccpi3corn,rootznaws,fips5,vpd_july,pr_total,year,state,gdd_10_30,gdd_30_99,latitude,longitude,geom_id)
+subdat2 = subdat2 %>% filter(rootznaws < 350 & rootznaws > 0)
+subdat2$soilvar = subdat2[[soilvar]]
+
+#original model, with FE for county and varying slopes by county
+soilmod1 = feols(yield_tha ~ soilvar | fips5[year],dat=subdat2)
+soilcoef = soilmod1$coefficients 
+
+#cubic
+subdat2$soilvar_sq = subdat2$soilvar ^ 2
+subdat2$soilvar_cu = subdat2$soilvar ^ 3
+soilmod_cub = feols(yield_tha ~ soilvar + soilvar_sq + soilvar_cu | fips5^year,dat=subdat2)
+
+#spline
+#build some basis functions for using fixest
+
+soilra=range(subdat2$soilvar)
+xpred=seq(soilra[1],soilra[2],len=20)
+
+
+#spline fit (w 4 knots) 
+require(splines)
+df=4
+q=bs(xpred,df=df)
+bases = data.frame(bs(subdat2$soilvar,df=df))
+names(bases)=paste0('splb',1:ncol(bases))
+spl.form = as.formula(paste0("yield_tha  ~ ", paste(names(bases), collapse = " + "),' | fips5^year'))
+soilmod_sp = feols(spl.form,dat=data.frame(subdat2,bases))
+
+#model with year FE instead of linear term
+# subdat2 = subdat2 %>% mutate(stateyear = paste(state,year,sep='_'))
+# soilmod_yearFE = feols(yield_tha ~ soilvar | fips5 + stateyear,dat=subdat2)
+# soilcoef_yearFE = soilmod_yearFE$coefficients 
+
+#model with county-year fixed effects instead of countylinear term
+soilmod_yearFE = feols(yield_tha ~ soilvar | fips5^year,dat=subdat2)
+soilcoef_yearFE = soilmod_yearFE$coefficients 
+
+#model with FE by spatial grid
+subdat2 = subdat2 %>% mutate(lat_quart = round(latitude*4)/4,lon_quart = round(longitude*4)/4, LL_grid = paste(lat_quart,lon_quart,sep='_'))
+
+soilmod_LL = feols(yield_tha ~ soilvar | LL_grid[year],dat=subdat2)
+soilcoef_LL = soilmod_LL$coefficients 
+
+#model with unit-level random effects
+require(lme4)
+soilmod_RE = lmer(yield_tha ~ soilvar + year*state + (1 | geom_id),dat=subdat2)
+soilcoef_RE = summary(soilmod_RE)$coeff['soilvar',1]
+
+#make predicted values for plot
+soilres_cub = apply(rbind(xpred ,xpred^2,xpred^3) * soilmod_cub$coefficients,2,sum)
+soilres_sp = sapply(1:nrow(q),function(x) sum(q[x,]*soilmod_sp$coefficients[1:ncol(bases)]))
+
+ 
+#par(mfrow=c(1,2),mar=c(5,5,1,.5),xpd=F)
+ylim=c(9.5,12)
+#cols=c('dark green','dark blue','dark red','','')
+cols=brewer.pal(5,'Accent')
+ceny = function(x,y,targ=250){
+  temp = approx(x,y,xout=targ)
+  y - temp$y
+}
+
+ylim=c(-1,.5)
+par(lwd=3)
+plot(xpred,ceny(xpred,xpred*soilcoef_yearFE),xlab=xlabl,ylab='Yield Response (t/ha)',type='l',col=cols[1],main='',ylim=ylim)
+lines(xpred,ceny(xpred,soilres_cub),col=cols[2])
+lines(xpred,ceny(xpred,soilres_sp),col=cols[3])
+#lines(xpred,ceny(xpred,xpred*soilcoef_yearFE),col=cols[4])
+lines(xpred,ceny(xpred,xpred*soilcoef_LL),col=cols[4])
+lines(xpred,ceny(xpred,xpred*soilcoef_RE),col=cols[5])
+
+par(new=T)
+a=hist(subdat2[[soilvar]],breaks=breaks,plot=F)
+plot(a,col=gray(.7),freq=F,ylim=histylim,axes=F,xlab='',ylab='',main='')
+
+legend('topleft',leg=c('linear, county-year FE','cubic, county-year FE','spline, county-year FE','linear, lat x lon FE','linear, point-level RE'),lwd=2,col=cols,bty='n')
+dev.print(png,filename=paste0(soilvar,'.robustchecks.png'),width=6,h=5,units='in',res=200)
+
+```
+
+add analysis of in-season or end-season soil moisture based on hydrological model, 
+to compare with analysis based on soil capacity
+```{r}
+#read in file that has monthly simulated soil moisture for each location
+soilm = readRDS('~/Dropbox/sens_drought_2019/scym_trends/soilmoisturemodel_totalvar_Allstates_wide.rds')
+#soilm_byyr = soilm %>% group_by(year) %>% summarize(julm = mean(soil.7))
+#plot(soilm_byyr)
+soilvar='rootznaws'
+#add deficit of ET0- AET
+soilm = soilm %>% mutate(def.7 = eto_tot.7 - aet.7 ,def.8 = eto_tot.8 - aet.8,def.9 = eto_tot.9 -aet.9,eto_tot = eto_tot.7+eto_tot.8+eto_tot.9,
+                         aet = aet.7 + aet.8 + aet.9,def.all = eto_tot - aet)
+
+plot1= function(gid){
+  ind=which(soilm$geom_id == gid)
+  ylim=c(0,soilm$rootznaws[ind[1]]+5)
+  plot(soilm$year[ind],soilm$soil.7[ind],type='l',xlab='year',ylab='soilm',ylim=ylim)
+  lines(soilm$year[ind],soilm$soil.8[ind],lty=2)
+  lines(soilm$year[ind],soilm$soil.9[ind],lty=3)
+  lines(soilm$year[ind],soilm$rootznaws[ind],lty=2)
+  par(new=T)
+  plot(soilm$year[ind],soilm$eto.7[ind],col=2,type='l',axes=F,ylim=c(0,10),xlab='',ylab='')
+  axis(4)
+  lines(soilm$year[ind],soilm$pr.7[ind],col=4)
+}
+require(viridis)
+plot2 = function(fips,cols=magma(22)){
+  ind=sample(which(subdat3$fips5 == fips),size=1e2,replace=F)
+  ind2 = which(subdat3$geom_id %in% subdat3$geom_id[ind])
+  ylim=xlim=c(0,350)
+#  ptcols=cols[soilm$year[ind2]-min(soilm$year[ind2])+1]
+  ptcols = 1 + (subdat3$year[ind2]==2012)
+  plot(subdat3$rootznaws.x[ind2],subdat3$soil.7[ind2],col=ptcols,xlab='paws',ylab='July soilm',ylim=ylim,xlim=xlim)
+}
+
+#merge with the data frame use above
+subdat2 = subdat %>% select(yield_tha,nccpi3corn,rootznaws,fips5,vpd_july,pr_total,year,state,gdd_10_30,gdd_30_99,latitude,longitude,geom_id)
+subdat2 = subdat2 %>% filter(rootznaws < 350 & rootznaws > 0)
+subdat2$soilvar = subdat2[[soilvar]]
+subdat2$yieldvar = subdat2[['yield_tha']]
+subdat3 = merge(subdat2,soilm,by=c('geom_id','year'),sort=F)
+
+#if (use.log) subdat2$yieldvar = log(subdat2[['yield_tha']]) else subdat2$yieldvar = subdat2[['yield_tha']]
+#some plots to explore data
+if (0) {
+  require(corrplot)
+  corrplot.mixed(cor(subdat3[,c(17:21,30,26:29,32)],use='p'),lower="ellipse",upper='number')
+  dev.print(png,filename=paste0('~/Dropbox/sens_drought_2019/moistcor.png'),width=6,h=5,units='in',res=200)
+  
+  par(mfrow=c(2,2))
+  boxplot(soil.7 ~ year,data=subdat3); abline(h=100)
+  boxplot(def.7 ~ year,data=subdat3); abline(h=100)
+  boxplot(soil.9 ~ year,data=subdat3); abline(h=100)
+  boxplot(def.9 ~ year,data=subdat3); abline(h=100)  
+  
+  #what should functional form be for soilm vs yield
+  moistfit = lowess(subdat3$soil.7,subdat3$yieldvar)
+  logmoistfit =  lowess(log(subdat3$soil.7),subdat3$yieldvar)
+  deffit = lowess(subdat3$def.7,subdat3$yieldvar)
+  logdeffit = lowess(log(subdat3$def.7+1),subdat3$yieldvar)
+  par(mfrow=c(2,2))
+  ylim=c(8,12)
+  plot(moistfit,xlab='July Moisture',ylab='Average Yield (t/ha)',type='l',col='dark green',ylim=ylim,main='',xlim=xlim,lwd=2)
+  plot(logmoistfit,xlab='Log July Moisture',ylab='Average Yield (t/ha)',type='l',col='dark green',ylim=ylim,main='',xlim=c(0,6),lwd=2)
+  plot(deffit,xlab='July Deficit (eto-aet)',ylab='Average Yield (t/ha)',type='l',col='dark blue',ylim=ylim,main='',xlim=xlim,lwd=2)
+    plot(logdeffit,xlab='Log July Deficit',ylab='Average Yield (t/ha)',type='l',col='dark blue',ylim=ylim,main='',xlim=c(0,6),lwd=2)
+  dev.print(png,filename=paste0('~/Dropbox/sens_drought_2019/julmoist.yield.png'),width=8,h=8,units='in',res=200)
+    
+  }
+#how variable is july soilm or rain or paws after removing county-year mean
+temp1 = feols(soil.7 ~ 1 | fips5^year,data=subdat3) #july moisture
+temp2 = feols(rootznaws.x ~ 1 | fips5^year,data=subdat3) #paws
+temp3 = feols(eto_tot.7 ~ 1 | fips5^year,data=subdat3) #ref ET
+temp4 = feols(pr_tot.7 ~ 1 | fips5^year,data=subdat3) #pr
+temp5 = feols(def.7 ~ 1 | fips5^year,data=subdat3) #ref ET- act ET
+temp6 = feols(yield_tha ~ 1 | fips5^year,data=subdat3) $yield
+sd(temp2$residuals); sd(temp3$residuals); sd(temp4$residuals)
+cor(cbind(temp1$res,temp2$res,temp3$res,temp4$res,temp5$res,temp6$res))
+#can look at soil moisture directly 
+subdat3 = subdat3 %>% mutate(logjul = log(soil.7),logaug = log(soil.8),logsep=log(soil.9))
+yrs = sort(unique(subdat3$year))
+soilcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yieldvar ~ rootznaws.x | fips5,subdat3 %>% filter(year == x))$coeftable[1]))
+jul.soilmcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yieldvar ~ logjul | fips5,subdat3 %>% filter(year == x))$coeftable[1]))
+aug.soilmcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yieldvar ~ logaug | fips5,subdat3 %>% filter(year == x))$coeftable[1]))
+sep.soilmcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yieldvar ~ logsep | fips5,subdat3 %>% filter(year == x))$coeftable[1]))
+jul.defcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yieldvar ~ def.7 | fips5,subdat3 %>% filter(year == x))$coeftable[1]))
+aug.defcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yieldvar ~ def.8 | fips5,subdat3 %>% filter(year == x))$coeftable[1]))
+sep.defcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yieldvar ~ def.9 | fips5,subdat3 %>% filter(year == x))$coeftable[1]))
+jas.defcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yieldvar ~ def.all | fips5,subdat3 %>% filter(year == x))$coeftable[1]))
+
+# these year interactions only make sense with county-year FE 
+soilmod_wfipsyr = feols(yieldvar ~ soilvar + soilvar : year | fips5^year,dat=subdat3)
+julmod_wfipsyr = feols(yieldvar ~ logjul + logjul : year | fips5^year,dat=subdat3)
+augmod_wfipsyr = feols(yieldvar ~ logaug + logaug : year | fips5^year,dat=subdat3)
+sepmod_wfipsyr = feols(yieldvar ~ logsep + logsep : year | fips5^year,dat=subdat3)
+juleto_wfipsyr = feols(yieldvar ~ eto_tot.7 + logjul : year | fips5^year,dat=subdat3)
+julpr_wfipsyr = feols(yieldvar ~ pr_tot.7 + logjul : year | fips5^year,dat=subdat3)
+
+#soilbeta.byyr = soilmod_wfipsyr$coefficients['soilvar'] + yrs * soilmod_wfipsyr$coefficients['soilvar:year'] 
+# par(mfrow=c(2,2))
+# pd1 = list(jul.soilmcoefs.byyr,aug.soilmcoefs.byyr,sep.soilmcoefs.byyr)
+# pd2 = list(julmod_wfipsyr$coeff,augmod_wfipsyr$coeff,sepmod_wfipsyr$coeff)
+# #pd2 = lapply(pd1,function(x) lm(x~yrs)$coeff)
+# ylab= expression(paste(beta['log(Soil moist)']));
+# ylim=c(0,.4);yscale=1e0
+# cols=brewer.pal(3,'Set2')
+# plot(yrs,yscale*pd1[[1]],type='l',xlab='Year',ylab=ylab,ylim=ylim,lwd=2,cex.axis=1.0,col=cols[1])
+# #abline(h=.2)
+# for (i in 1:3){
+#   lines(yrs,yscale*pd1[[i]],lwd=2,col=cols[i])
+#   abline(yscale*pd2[[i]],col=cols[i],lty=2,lwd=2)
+# }
+# legend('topleft',leg=c('July','August','Sep'),bty='n',lwd=2,col=cols)
+
+# #plot for deficit
+# pd1 = list(jul.defcoefs.byyr,aug.defcoefs.byyr,sep.defcoefs.byyr)
+# pd2 = lapply(pd1,function(x) lm(x~yrs)$coeff)
+# ylab= expression(paste(beta['(ETo - AET)']));
+# ylim=c(-20,0);yscale=1e3
+# cols=brewer.pal(3,'Set2')
+# plot(yrs,yscale*pd1[[1]],type='l',xlab='Year',ylab=ylab,ylim=ylim,lwd=2,cex.axis=1.0,col=cols[1])
+# #abline(h=.2)
+# for (i in 1:3){
+#   lines(yrs,yscale*pd1[[i]],lwd=2,col=cols[i])
+#   abline(yscale*pd2[[i]],col=cols[i],lty=2,lwd=2)
+# }
+# lines(yrs,yscale*jas.defcoefs.byyr,lwd=2,col=1)
+# legend('topleft',leg=c('July','August','Sep'),bty='n',lwd=2,col=cols)
+
+
+```
+
+version of fig 4 in paper but using soil moisture variables
+```{r}
+states = unique(subdat2$state)
+yrs=sort(unique(subdat2$year))
+nstate=length(states)
+#use county-year fixed effects
+hold = list()
+soilvars = c('rootznaws.x','logjul','logaug','logsep')
+for (soilvar in soilvars){
+  subdat3$soilvar=subdat3[[soilvar]]
+  allfit = feols(yieldvar ~ soilvar + soilvar : year | fips5^year,dat=subdat3)
+  soilbetas = allfit$coefficients['soilvar'] + yrs * allfit$coefficients['soilvar:year'] 
+  state_soilbyyr = lapply(states,function(x) {
+    ind=which(is.finite(subdat3[[soilvar]]*subdat3$yieldvar) & subdat3$state.x == x)
+    tempfit = feols(yieldvar ~ soilvar + soilvar : year | fips5^year,dat=subdat3[ind,])
+    out = tempfit$coefficients['soilvar'] + yrs * tempfit$coefficients['soilvar:year']  })
+   hold[[soilvar]]=list(soilbetas,state_soilbyyr)
+}
+
+getdel = function(x) diff(range(x))
+par(mfrow=c(2,2),mar=c(4,5,.5,.5))
+yscale=1e3; ylab2=expression(paste('Average ',beta));ylab3=expression(paste('Delta ',beta))
+ylim=c(1,6)
+#for (soilvar in soilvars){
+ylab= expression(paste(beta['PAWS']));
+plot(yrs,yscale*soilcoefs.byyr,type='l',xlab='Year',ylab=ylab,ylim=ylim,lwd=2,cex.axis=1.0)
+#abline(yscale*soilmod_wfipsyr$coeff,lwd=2,lty=2) #these are equivalent
+abline(lm((yscale*soilcoefs.byyr) ~ yrs)$coef,lwd=2,lty=2) #these are equivalent
+legend('topleft','(a)',bty='n',cex=1.5,adj=c(1,0))
+xvals = yscale * c(mean(hold[['rootznaws.x']][[1]]),sapply(hold[['rootznaws.x']][[2]],mean))
+yvals = yscale * c(getdel(hold[['rootznaws.x']][[1]]),sapply(hold[['rootznaws.x']][[2]],getdel))
+cols=brewer.pal(nstate,'Set3')
+plot(xvals,yvals,col=c(1,cols),xlim=range(xvals)*c(0,1.1),ylim=range(yvals)*c(0,1.1),
+     xlab=ylab2,ylab=ylab3)
+text(xvals,yvals,labels=c('All',states),pos=4,cex=.9,col=c(1,cols))
+legend('topleft','(b)',bty='n',cex=1.5,adj=c(1,0))
+
+pd1 = list(jul.soilmcoefs.byyr,aug.soilmcoefs.byyr,sep.soilmcoefs.byyr)
+pd2 = lapply(pd1,function(x) lm(x~yrs)$coeff)
+#pd2 = list(julmod_wfipsyr$coeff,augmod_wfipsyr$coeff,sepmod_wfipsyr$coeff)
+ylab= expression(paste(beta['log(SM)']));
+ylim=c(0,.4);yscale=1e0
+cols=brewer.pal(3,'BuPu')
+plot(yrs,yscale*pd1[[1]],type='l',xlab='Year',ylab=ylab,ylim=ylim,lwd=2,cex.axis=1.0,col=cols[1])
+for (i in 1:3){
+  lines(yrs,yscale*pd1[[i]],lwd=2,col=cols[i])
+  abline(yscale*pd2[[i]],col=cols[i],lty=2,lwd=2)
+}
+legend('topleft','(c)',bty='n',cex=1.5,adj=c(1,0))
+legend('topright',leg=c('July soil moisture','Aug soil moisture','Sep soil moisture'),lwd=2,col=cols,bty='n',cex=0.8)
+
+xvals = yscale * c(mean(hold[['logjul']][[1]]),sapply(hold[['logjul']][[2]],mean))
+yvals = yscale * c(getdel(hold[['logjul']][[1]]),sapply(hold[['logjul']][[2]],getdel))
+cols=brewer.pal(nstate,'Set3')
+plot(xvals,yvals,col=c(1,cols),xlim=range(xvals)*c(0,1.1),ylim=range(yvals)*c(0,1.1),
+     xlab=ylab2,ylab=ylab3)
+text(xvals,yvals,labels=c('All',states),pos=4,cex=.9,col=c(1,cols))
+legend('topleft','(d)',bty='n',cex=1.5,adj=c(1,0))
+
+dev.print(png,filename=paste0('~/Dropbox/sens_drought_2019/paws.soilm.bystate.png'),width=8,h=8,units='in',res=200)
+
+```
+
+
+repeat above figures but for soybean
+```{r}
+soysub =  dat %>% filter(state %in% states_to_use,SCYMcrop %in% "Soybeans")
+
+soilvar = 'rootznaws'
+#soilvar = 'nccpi3corn'
+if (soilvar == 'rootznaws') {
+  ylab='Beta_Rootznaws * 100'
+  yscale=100
+}
+if (soilvar == 'nccpi3corn') {
+  ylab='Beta_NCCPI'
+  yscale = 1
+}  
+
+soysub$soilvar = soysub[[soilvar]]
+
+yrs = sort(unique(soysub$year))
+soilcoefs.byyr = as.numeric(sapply(yrs,function(x) feols(yield_tha ~ soilvar | fips5[year],soysub %>% filter(year == x))$coeftable[1]))
+  
+soilmod_wfipsyr = feols(yield_tha ~ soilvar + soilvar : year | fips5[year],dat=soysub)
+soilbeta.byyr = soilmod_wfipsyr$coefficients['soilvar'] + yrs * soilmod_wfipsyr$coefficients['soilvar:year'] 
+
+states = unique(soysub$state)
+yrs=sort(unique(soysub$year))
+nstate=length(states)
+state_soilbyyr = lapply(states,function(x) {
+   ind=which(is.finite(soysub[[soilvar]]*soysub$yield_tha) & soysub$state == x)
+   tempfit = feols(yield_tha ~ soilvar + soilvar : year | fips5[year],dat=soysub[ind,])
+   out = tempfit$coefficients['soilvar'] + yrs * tempfit$coefficients['soilvar:year']  })
+
+#plot estimate in each year and then linear trend by state
+png(filename=paste0(soilvar,'.fig5.soybean.png'),width=8,h=3,units='in',res=200)
+par(mfrow=c(1,2),mar=c(5,5,1,.5),xpd=F)
+ylim=yscale*range(unlist(state_soilbyyr))
+plot(yrs,yscale*soilcoefs.byyr,type='l',xlab='Year',ylab=ylab,ylim=ylim,lwd=2,cex.axis=1.0)
+lines(yrs,yscale*soilbeta.byyr,lwd=2,lty=2)
+
+cols=brewer.pal(nstate,'Set3')
+plot(yrs,yscale*soilbeta.byyr,lwd=2,type='l',xlab='year',ylab=ylab,ylim=ylim,cex.axis=1.0)
+for (i in 1:nstate) lines(yrs,yscale*state_soilbyyr[[i]],col=cols[i],lwd=2)
+par(xpd=T)
+legend("topleft", inset=c(.03,0), leg=c('all',states),col=c(1,cols),lwd=2,bty='n',ncol=2,cex=.6)
+dev.off()
+```
+
+#Summarize how RZAWS interacts with rainfall and EDD
+```{r}
+setwd('~/Dropbox/sens_drought_2019/')
+
+updat = readRDS('scym_trends/mergedStaticAnnual_maizeScym2020_soyLoAz2017_covar1_maizeOnly_NAremoved_2020-04-04.rds')
+updat = updat %>% filter(yield_tha < 20) %>% mutate(pr_total = ppt_apr + ppt_may + ppt_jun + ppt_jul + ppt_aug)
+states_to_use=unique(updat$state)#use all states
+crop = c('Corn')
+upsubdat = updat %>% filter(state %in% states_to_use,SCYMcrop %in% crop)
+
+#first plot annual means of weather variables to compare with panel values
+fieldweath = upsubdat %>% group_by(year) %>% summarize_at(c('GDD_8_30','EDD_30_99','pr_total','pr_early'),mean,na.rm=T)
+
+cols=c('black','dark green','dark red','dark blue')
+#png(filename=paste0('county.field.weather.png'),width=6,h=4,units='in',res=200)
+par(mfrow=c(2,2),mar=c(2,4,1,1))
+plot(weathbyyr$year,weathbyyr$GDD,xlab='Year',ylab='',lwd=2,type='l',col=cols[2],axes=F)
+axis(1,at=seq(2000,2020,10))
+axis(2,col.axis=cols[2],col=cols[2])
+lines(fieldweath$year,fieldweath$GDD_8_30,col=cols[2],lwd=2,lty=2)
+legend('topleft',bty='n',leg='GDD',text.col = cols[2],inset=c(-.05,0))
+#par(new=T)
+plot(weathbyyr$year,weathbyyr$EDD,xlab='Year',ylab='',lwd=2,type='l',col=cols[3],axes=F)
+axis(1,at=seq(2000,2020,10))
+axis(2,col.axis=cols[3],col=cols[3])
+lines(fieldweath$year,fieldweath$EDD_30_99,col=cols[3],lwd=2,lty=2)
+legend('topleft',bty='n',leg='EDD',text.col = cols[3],inset=c(-.05,0))
+plot(weathbyyr$year,weathbyyr$ppt,xlab='Year',ylab='',lwd=2,type='l',col=cols[4],axes=F)
+axis(1,at=seq(2000,2020,10))
+axis(2,col.axis=cols[4],col=cols[4])
+lines(fieldweath$year,fieldweath$pr_total,col=cols[4],lwd=2,lty=2)
+legend('topleft',bty='n',leg='Precip (mm)',text.col = cols[4],inset=c(-.05,0))
+
+upsubdat$soilvar = upsubdat[[soilvar]]
+soilmod2 = feols(yield_tha ~soilvar*GDD_8_30 | fips5[year],dat=upsubdat)
+soilmod2$coeftable
+soilmod3 = feols(yield_tha ~soilvar*EDD_30_99 | fips5[year],dat=upsubdat)
+soilmod3$coeftable
+soilmod4 = feols(yield_tha ~soilvar*pr_total | fips5[year],dat=upsubdat)
+soilmod4$coeftable
+soilmod5 = feols(yield_tha ~soilvar*pr_early | fips5[year],dat=upsubdat)
+soilmod5$coeftable
+soilmod6 = feols(yield_tha ~soilvar*GDD_8_30 + soilvar*EDD_30_99 + soilvar*pr_total + soilvar*pr_early | fips5[year],dat=upsubdat)
+soilmod6$coeftable
+
+#test if trends in each of those variables are big enough to drive a trend in soil importance
+nyr = nrow(weathbyyr)
+makerow = function(varname,varmod){
+  tempfit = lm(fieldweath[[varname]] ~ fieldweath$year)
+  #output the trend value in 1999, 2018 and the delta, and associated values of soilvar coef
+  temp1 = c(predict(tempfit)[c(1,nyr)],(nyr-1)*tempfit$coefficients[2])
+  ctable = varmod$coeftable
+  temp2 = 100*c(ctable[1,1] + ctable[3,1]*temp1[1:2],ctable[3,1] * temp1[3])
+  c(temp1,ctable[c(1:3),1] * c(100,1,100),temp2)
+}
+
+wtrend.table = data.frame(gdd=makerow('GDD_8_30',soilmod2),
+edd=makerow('EDD_30_99',soilmod3),pr_tot=makerow('pr_total',soilmod4),pr_early=makerow('pr_early',soilmod5))
+row.names(wtrend.table)=c('trendVal1999','trendVal2018','Delta','soilCoef','weathCoef','weathxsoilCoef',paste0(soilvar,c('1999',
+   '2018','Delta')))
+write.csv(signif(wtrend.table,3),file='weathtrends.soilsens.csv')
+
+```
+
+#compare a plot of avg nass yields to avg scym yields
+```{r}
+
+#this is just approximate would need to scale each counties avg yield by the total area in that county.
+scymavg = subdat2 %>% group_by(year) %>% summarize(my = mean(yield_tha,na.rm=T))
+
+plot(weathbyyr$year,weathbyyr$cornYield,xlab='Year',ylab='',lwd=2,type='l',col=cols[1],ylim=c(6,13))
+lines(scymavg$year,scymavg$my,col=2)
+
+
+```
+
+#calculate statistics of agreement with nass
+```{r}
+nassdat = read.csv('~/Dropbox/sens_drought_2019/allScalesAgreement_nassCountyOnly_forDavid.csv')
+
+#overall corr
+cor(nassdat$scymYield,nassdat$validYield)^2
+
+#spatial cor by year
+cbyyr = nassdat %>% group_by(year) %>% summarize(r2_nass_scym = cor(scymYield,validYield)^2)
+median(cbyyr$r2_nass_scym)
+mean(cbyyr$r2_nass_scym)
+
+#temporal cor by county
+cbyfips = nassdat %>% group_by(fips5) %>% summarize(r2_nass_scym = cor(scymYield,validYield,use='p')^2)
+median(cbyfips$r2_nass_scym,na.rm=T)
+mean(cbyfips$r2_nass_scym,na.rm=T)
+
+```
+
